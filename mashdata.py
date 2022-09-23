@@ -1,4 +1,5 @@
 from __future__ import annotations, division
+import logging
 from typing import Tuple
 from os import listdir
 import json
@@ -12,6 +13,7 @@ class Section:
 	''' Defines data object that contains spotify analysis section data.
 	
 	Attrs:
+		index (int): Index of section in track
 		start_time (float): Start time in seconds from beginning of track
 		duration (float): Duration of section in seconds
 		confidence (float): Spotify Analysis Confidence of section designation
@@ -23,8 +25,10 @@ class Section:
 		track_measures (np.ndarray): Holds start and end measure indexes after sync
 
 	'''
+	index: int
 	start_time: float					
 	duration: float
+	end_time: float
 	confidence: float
 	loudness: float
 	tempo: Tuple[float, float]
@@ -33,7 +37,9 @@ class Section:
 	time_signature: Tuple[int, float]
 	track_measures: np.ndarray
 
-	def __init__(self, section_data: dict) -> None:
+	def __init__(self, section_data: dict, index: int, title: str) -> None:
+		self.index = index
+		self.track_title = title
 		self.start_time = section_data['start']			
 		self.duration = section_data['duration']
 		self.end_time = self.start_time + self.duration
@@ -44,33 +50,42 @@ class Section:
 		self.mode = section_data['mode'], section_data['mode_confidence']
 		self.time_signature = (section_data['time_signature'], 
 							section_data['time_signature_confidence'])
+
+		self.logger = logging.getLogger(f"mashdata:section:{title}:{index}")
 	
 	def sync_to_measure(self) -> int:
 		''' Sets start_time and duration to sync with closest measure times
 			(Must be called from MashSong methods)
 			Returns the end index to begin from the next iteration
 		'''
-		start_ind = 0		#np.searchsorted(self.track_measures, self.start_time, 'left') - 1
-		end_ind = np.searchsorted(self.track_measures, self.end_time)
+		start_ind = 0
+		end_ind = np.searchsorted(self.track_measures, self.end_time)-1
 
-		if end_ind >= len(self.track_measures):
-			end_ind = len(self.track_measures) - 1
+		# if end_ind >= len(self.track_measures):
+		# 	end_ind = len(self.track_measures) - 1
 		
+		self.logger.info(f"Orig Times: {self.start_time} - {self.start_time+self.duration}")
+
 		self.start_time = self.track_measures[start_ind]
-		self.duration = self.track_measures[end_ind] - self.start_time
 		self.end_time = self.track_measures[end_ind]
+		self.logger.info(f"Extended by {self.end_time-self.start_time - self.duration}")
+		self.duration = self.end_time - self.start_time
 		
-		del self.track_measures
+
+		self.track_measures = self.track_measures[start_ind:end_ind]
+
+		self.logger.info(f"Synced to {self.start_time} - {self.end_time}, spanning {end_ind} measures")
 		return end_ind
 
 	def __str__(self) -> str:
-		string = f"\tStart: {self.start_time}\n\tStop: {self.start_time+self.duration}\n\tLoudness: {self.loudness}\n\tDuration: {self.duration}"
+		string = f"Section {self.index}:\n\tStart: {self.start_time}\n\tStop: {self.end_time}\n\tLoudness: {self.loudness}\n\tDuration: {self.duration}"
 		return string
 
 class MashSong:
 	'''	Defines data object that represents a Song Track 
 		and holds its stems and Spotify analysis data
 	'''
+
 	FRAME_RATE: int = 44100		# (Sample Rate)
 	SAMPLE_WIDTH: int = 2		# in bytes (1 = 8bit)
 	CHANNELS: int = 2			# {mono:1, stereo:2}
@@ -84,12 +99,16 @@ class MashSong:
 
 	def __init__(self, title: str, info: dict) -> None:
 		self.title = title
+		self.logger = logging.getLogger(f"mashdata:mashsong:{title}")
 		self.key = int(info['track']['key'])	# int(0-11) that maps C, C#,...B
 		self.bpm = float(info['track']['tempo'])
-		self.sections = [Section(section) for section in info['sections']]
-		self.measures = bars_to_measures(info['bars'])
+		self.logger.info(f"Measure Length: {(60/self.bpm)*16}")
+		self.sections = [Section(section, ind, title) for ind, section in enumerate(info['sections'])]
+		self.measures = measures_from_confident_beat(info['beats'])
 		self.stems = self.fetch_stems()
 		self.sync_sections_to_measures()
+
+		
 
 	@classmethod
 	def get_song_from_search(
@@ -113,7 +132,7 @@ class MashSong:
 		spotify = Spotify(client_credentials_manager=SpotifyClientCredentials())
 		uri = spotify.search(query, 1)['tracks']['items'][0]['uri']
 		info = spotify.audio_analysis(uri)
-		title = format_title(title)
+		title = title.title().replace(' ', '')
 
 		if save_data:
 			
@@ -139,7 +158,6 @@ class MashSong:
 		with file.open() as f:
 			info = json.load(f)
 		title = filename.removesuffix('Info.json')
-		print(title)
 		return MashSong(title, info)
 
 	def fetch_stems(self):
@@ -240,11 +258,6 @@ class MashSong:
 
 
 # Helper Functions
-
-def format_title(title: str) -> str:
-	'''Capitalizes words in title and removes spaces'''
-	return title.title().replace(' ', '')
-
 def pitch_shift_by_frame(stem_segment: AudioSegment, shift_amt: float) -> np.ndarray:
 	''' Scale framerate to shift to target pitch. Returns np array of 16-bit samples.
 		(Tempo changes as a side effect)
@@ -267,7 +280,18 @@ def bars_to_measures(bars: list) -> np.ndarray:
 	measures = np.array(start_times,np.float32)
 	return measures
 
+def beats_to_measures(beats: list) -> np.ndarray:
+	''' Converts list of beats into 1D np array
+	'''
+	measure_list = beats[::16]
+	start_times = [bar['start'] for bar in measure_list]
+	measures = np.array(start_times,np.float32)
+	return measures
 
-
-
-
+def measures_from_confident_beat(beats: list) -> np.ndarray:
+	confidences = [beat['confidence'] for beat in beats[0:2]]
+	start = confidences.index(max(confidences))
+	measure_list = beats[start::16]
+	start_times = [bar['start'] for bar in measure_list]
+	measures = np.array(start_times,np.float32)
+	return measures
