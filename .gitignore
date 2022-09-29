@@ -1,6 +1,5 @@
 .vscode/
 data/
 __pycache__/
-pretrained_models/
 .cache
-
+pretrained_models/
